@@ -17,13 +17,17 @@ import re
 from collections import Counter
 
 import idaapi
+import ida_pro
 
 from idc import *
 from idaapi import *
 from idautils import *
 
 try:
-  from PyQt5 import QtWidgets
+  if ida_pro.IDA_SDK_VERSION >= 920:
+    from PySide6 import QtWidgets
+  else:
+    from PyQt5 import QtWidgets
 except ImportError as e:
   print(f'{os.path.basename(__file__)} importerror {e}')
 

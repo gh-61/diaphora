@@ -27,8 +27,12 @@ import difflib
 import idc
 import idaapi
 import idautils
+import ida_pro
 
-from PyQt5 import QtWidgets
+if ida_pro.IDA_SDK_VERSION >= 920:
+  from PySide6 import QtWidgets
+else:
+  from PyQt5 import QtWidgets
 from pygments import highlight
 from pygments.formatters import HtmlFormatter
 from pygments.lexers import NasmLexer, CppLexer, DiffLexer

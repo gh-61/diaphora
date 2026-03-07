@@ -6,6 +6,21 @@
 
 Diaphora (διαφορά, Greek for 'difference') version 3.1.2 is the most advanced program diffing tool (working as an IDA plugin) available as of today (2024). It was released first during SyScan 2015 and has been actively maintained ever since: Diaphora has been ported to every single minor version of IDA since 6.8 to 8.4.
 
+## Fork additions
+
+This fork adds the following features on top of upstream Diaphora:
+
+ * **Parallel export** (`diaphora_parallel_export.py`) — Export IDA databases using multiple worker processes for significantly faster export of large binaries. Configurable number of workers, jobs, and timeout. Tested on binaries with 80k+ functions.
+ * **Skip export mode** — Option to skip the export step and diff directly against an existing SQLite database. Useful when re-diffing without re-exporting.
+ * **GUI improvements** — Added parallel worker count and timeout inputs to the IDA plugin form.
+ * **IDA auto-detection** — Automatically finds `idat`/`idat64` from `IDADIR` env var, `PATH`, or common install locations (Windows and Linux).
+ * **Reliability improvements** — Worker exit code checking, merge data loss detection, fatal timeouts with progress reporting, post-merge validation, version table deduplication, and cross-filesystem output handling.
+
+### Credits
+
+ * Parallel export is based on [PR #265](https://github.com/joxeankoret/diaphora/pull/265) by [@clslgrnc](https://github.com/clslgrnc) (Colas Le Guernic).
+ * IDA Pro 9.x support is based on [PR #339](https://github.com/joxeankoret/diaphora/pull/339) by [@GaoYuCan](https://github.com/GaoYuCan) (s1nk).
+
 Diaphora supports versions of IDA >= 7.4 because the code only runs in Python 3.X (Python 3.11 was the last version being tested).
 
 ## Unique Features

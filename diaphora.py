@@ -31,9 +31,11 @@ import importlib
 import threading
 import traceback
 
+from base64 import b64decode
 from io import StringIO
 from threading import Lock
 from multiprocessing import cpu_count
+from multiprocessing.managers import BaseManager
 
 import diaphora_config as config
 import diaphora_heuristics
@@ -65,6 +67,8 @@ from diaphora_heuristics import (
   get_query_fields,
 )
 
+from diaphora_sql import InsertInto, NATIVE, MICROCODE
+
 import db_support
 from db_support import schema
 
@@ -82,17 +86,20 @@ from jkutils.factor import (
 try:
   # pylint: disable-next=unused-import
   import idaapi
+  import ida_pro
+  from idc import ARGV
 
   IS_IDA = True
 except ImportError:
   IS_IDA = False
 
-importlib.reload(ml.basic_engine)
-importlib.reload(config)
-importlib.reload(schema)
-importlib.reload(jk_threads)
-importlib.reload(db_support)
-importlib.reload(diaphora_heuristics)
+if config.PARALLEL_EXPORT is False:
+  importlib.reload(ml.basic_engine)
+  importlib.reload(config)
+  importlib.reload(schema)
+  importlib.reload(jk_threads)
+  importlib.reload(db_support)
+  importlib.reload(diaphora_heuristics)
 
 if hasattr(sys, "set_int_max_str_digits"):
   sys.set_int_max_str_digits(0)
@@ -361,6 +368,7 @@ class CBinDiff:
     self.dbs_dict = {}
     self.db = None  # Used exclusively by the exporter!
     self.open_db()
+    self.insert_into = InsertInto()
 
     self.all_matches = {"best": [], "partial": [], "unreliable": []}
     self.matched_primary = {}
@@ -712,11 +720,6 @@ class CBinDiff:
     database.
     """
     instructions_ids = {}
-    sql = """insert into main.instructions (address, mnemonic, disasm,
-                      comment1, comment2, operand_names, name,
-                      type, pseudocomment, pseudoitp, func_id,
-                      asm_type)
-                values (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 'native')"""
     cur_execute = cur.execute
     for key in bb_data:
       for instruction in bb_data[key]:
@@ -746,7 +749,7 @@ class CBinDiff:
         instruction_properties.append(pseudocomment)
         instruction_properties.append(pseudoitp)
         instruction_properties.append(func_id)
-        cur.execute(sql, instruction_properties)
+        self.insert_into.main_instructions(cur_execute, instruction_properties, NATIVE)
         db_id = cur.lastrowid
         instructions_ids[addr] = db_id
     return cur_execute, instructions_ids
@@ -760,8 +763,6 @@ class CBinDiff:
     """
     num = 0
     bb_ids = {}
-    sql1 = "insert into main.basic_blocks (num, address, asm_type) values (?, ?, 'native')"
-    sql2 = "insert into main.bb_instructions (basic_block_id, instruction_id) values (?, ?)"
 
     self_get_bb_id = self.get_bb_id
     for key in bb_data:
@@ -770,33 +771,29 @@ class CBinDiff:
       ins_ea = str(key)
       last_bb_id = self_get_bb_id(ins_ea)
       if last_bb_id is None:
-        cur_execute(sql1, (num, str(ins_ea)))
+        self.insert_into.main_basic_blocks(cur_execute, (num, str(ins_ea)), NATIVE)
         last_bb_id = cur.lastrowid
       bb_ids[ins_ea] = last_bb_id
 
       # Insert relations between basic blocks and instructions
-      insert_args = []
       for instruction in bb_data[key]:
         ins_id = instructions_ids[instruction[0]]
-        insert_args.append([last_bb_id, ins_id])
-      cur.executemany(sql2, insert_args)
+        self.insert_into.main_bb_instructions(cur_execute, (last_bb_id, ins_id), NATIVE)
 
     # Insert relations between basic blocks
-    sql = "insert into main.bb_relations (parent_id, child_id) values (?, ?)"
-    insert_args = []
     for key in bb_relations:
       for bb in bb_relations[key]:
         bb = str(bb)
         key = str(key)
-        insert_args.append([bb_ids[key], bb_ids[bb]])
-    cur.executemany(sql, insert_args)
+        try:
+          self.insert_into.main_bb_relations(cur_execute, (bb_ids[key], bb_ids[bb]), NATIVE)
+        except:
+          # key doesnt exist because it doesnt have forward references to any bb
+          log(f"Error: {str(sys.exc_info()[1])}")
 
     # And finally insert the functions to basic blocks relations
-    insert_args = []
-    sql = "insert into main.function_bblocks (function_id, basic_block_id, asm_type) values (?, ?, 'native')"
     for key, bb_id in bb_ids.items():
-      insert_args.append([func_id, bb_id])
-    cur.executemany(sql, insert_args)
+      self.insert_into.main_function_bblocks(cur_execute, (func_id, bb_id), NATIVE)
 
   def save_microcode_instructions(
     self, func_id, cur, cur_execute, microcode_bblocks, microcode_bbrelations
@@ -804,27 +801,17 @@ class CBinDiff:
     """
     Save all the microcode instructions in the basic block @bb_data to the database.
     """
-    sql_inst = """insert into main.instructions (address, mnemonic, disasm, comment1,
-                         pseudocomment, func_id, asm_type)
-                values (?, ?, ?, ?, ?, ?, 'microcode')"""
-    sql_bblock = "insert into main.basic_blocks (num, address, asm_type) values (?, ?, 'microcode')"
-    sql_bbinst = "insert into main.bb_instructions (basic_block_id, instruction_id) values (?, ?)"
-    sql_bbrelations = (
-      "insert into main.bb_relations (parent_id, child_id) values (?, ?)"
-    )
-    sql_func_blocks = "insert into main.function_bblocks (function_id, basic_block_id, asm_type) values (?, ?, 'microcode')"
     num = 0
     for key in microcode_bblocks:
       # Create a new microcode basic block
       start_ea = self.get_valid_prop(microcode_bblocks[key]["start"])
-      cur_execute(sql_bblock, [num, start_ea])
+      self.insert_into.main_basic_blocks(cur_execute, [num, start_ea], MICROCODE)
       bblock_id = cur.lastrowid
       microcode_bblocks[key]["bblock_id"] = bblock_id
 
       # Add the function -> basic block relation
-      cur_execute(sql_func_blocks, (func_id, bblock_id))
+      self.insert_into.main_function_bblocks(cur_execute, (func_id, bblock_id), MICROCODE)
 
-      insert_args = []
       for line in microcode_bblocks[key]["lines"]:
         if line["mnemonic"] is not None:
           address = self.get_valid_prop(line["address"])
@@ -842,20 +829,18 @@ class CBinDiff:
             pseudocomment,
             func_id,
           ]
-          cur_execute(sql_inst, arguments)
+          self.insert_into.main_instructions(cur_execute, arguments, MICROCODE)
 
           inst_id = cur.lastrowid
           line["instruction_id"] = inst_id
 
           # Add the microcode instrution to the current basic block
-          insert_args.append([bblock_id, inst_id])
-      cur.executemany(sql_bbinst, insert_args)
+          self.insert_into.main_bb_instructions(cur_execute, (bblock_id, inst_id), MICROCODE)
 
       # Incrase the current basic block number
       num += 1
 
     # And, finally, insert the relationships between basic blocks
-    insert_args = []
     for node in microcode_bbrelations:
       parent_id = microcode_bblocks[node]["bblock_id"]
       for children in microcode_bbrelations[node]:
@@ -863,8 +848,7 @@ class CBinDiff:
         # with them, just ignore...
         if children in microcode_bblocks:
           child_id = microcode_bblocks[children]["bblock_id"]
-          insert_args.append([parent_id, child_id])
-    cur.executemany(sql_bbrelations, insert_args)
+          self.insert_into.main_bb_relations(cur_execute, [parent_id, child_id], MICROCODE)
 
   def get_function_from_dictionary(self, d):
     """
@@ -1091,25 +1075,8 @@ class CBinDiff:
         else:
           new_props.append(prop)
 
-      sql = """insert into main.functions (name, nodes, edges, indegree, outdegree, size,
-                    instructions, mnemonics, names, prototype,
-                    cyclomatic_complexity, primes_value, address,
-                    comment, mangled_function, bytes_hash, pseudocode,
-                    pseudocode_lines, pseudocode_hash1, pseudocode_primes,
-                    function_flags, assembly, prototype2, pseudocode_hash2,
-                    pseudocode_hash3, strongly_connected, loops, rva,
-                    tarjan_topological_sort, strongly_connected_spp,
-                    clean_assembly, clean_pseudo, mnemonics_spp, switches,
-                    function_hash, bytes_sum, md_index, constants,
-                    constants_count, segment_rva, assembly_addrs, kgh_hash,
-                    source_file, userdata, microcode, clean_microcode,
-                    microcode_spp, export_time)
-                  values (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?,
-                      ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?,
-                      ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)"""
-
       try:
-        cur.execute(sql, new_props)
+        self.insert_into.main_functions(cur.execute, new_props)
       except:
         logging.error(
           "Error handling props in save_function(): %s", str(new_props)
@@ -1123,18 +1090,13 @@ class CBinDiff:
 
       # Phase 2: Save the callers and callees of the function
       callers, callees = props[len(props) - 4:len(props) - 2]
-      sql = "insert into callgraph (func_id, address, type) values (?, ?, ?)"
-      insert_args = []
       for caller in callers:
-        insert_args.append([func_id, str(caller), "caller"])
+        self.insert_into.callgraph(cur.execute, (func_id, str(caller), "caller"))
 
       for callee in callees:
-        insert_args.append([func_id, str(callee), "callee"])
-      cur.executemany(sql, insert_args)
+        self.insert_into.callgraph(cur.execute, (func_id, str(callee), "callee"))
 
       # Phase 3: Insert the constants of the function
-      sql = "insert into constants (func_id, constant) values (?, ?)"
-      insert_args = []
       props_dict = self.create_function_dictionary(props)
       for constant in props_dict["constants"]:
         should_add = False
@@ -1145,8 +1107,7 @@ class CBinDiff:
           constant = str(constant)
 
         if should_add:
-          insert_args.append([func_id, constant])
-      cur.executemany(sql, insert_args)
+          self.insert_into.constants(cur.execute, (func_id, constant))
 
       # Phase 4: Save the basic blocks relationships
       if not self.function_summaries_only:
@@ -3859,6 +3820,26 @@ class CBinDiff:
       cur.close()
     return True
 
+class QueueManager(BaseManager):
+  pass
+
+def init_parallel_export() -> None:
+  config.PARALLEL_EXPORT = True
+  config.WORKER_ID = int(ARGV[1])
+  config.NUMBER_OF_WORKERS = int(ARGV[2])
+  if config.WORKER_ID == config.NUMBER_OF_WORKERS:
+    # finalizing, no need to initilize queues
+    return
+
+  port = int(ARGV[3])
+  authkey = b64decode(ARGV[4].encode("ASCII"))
+  QueueManager.register('get_job_queue')
+  QueueManager.register('get_report_queue')
+  m = QueueManager(address=('localhost', port), authkey=authkey)
+  m.connect()
+  config.PARALLEL_JOB_QUEUE = m.get_job_queue()
+  config.PARALLEL_REPORT_QUEUE = m.get_report_queue()
+
 
 if __name__ == "__main__":
   version_info = sys.version_info
@@ -3894,9 +3875,18 @@ if __name__ == "__main__":
     with open(script, "rb") as f:
       buf = f.read()
 
+    if len(ARGV) == 5:
+      init_parallel_export()
+
     # pylint: disable-next=exec-used
     exec(compile(buf, script, "exec"))
     do_diff = False
+
+    if config.PARALLEL_EXPORT is True and config.PARALLEL_REPORT_QUEUE is not None:
+      # Report and close IDA for current worker in parallel export
+      config.PARALLEL_REPORT_QUEUE.put((config.WORKER_ID, -1))
+      ida_pro.qexit(0)
+
   else:
     import argparse
 

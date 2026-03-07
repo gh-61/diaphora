@@ -24,9 +24,11 @@ import decimal
 import difflib
 import sqlite3
 import datetime
+import subprocess
 import traceback
 
 from hashlib import md5
+from typing import Iterable, Set, Tuple
 
 # pylint: disable=wildcard-import
 # pylint: disable=unused-wildcard-import
@@ -36,6 +38,7 @@ from idautils import *
 # pylint: enable=unused-wildcard-import
 # pylint: enable=wildcard-import
 
+import ida_pro
 import idaapi
 
 idaapi.require("diaphora")
@@ -70,7 +73,13 @@ except ImportError:
   HAS_GET_SOURCE_STRINGS = False
 
 # pylint: disable-next=wrong-import-order
-from PyQt5 import QtWidgets
+try:
+  if ida_pro.IDA_SDK_VERSION >= 920:
+    from PySide6 import QtWidgets
+  else:
+    from PyQt5 import QtWidgets
+except ImportError:
+  QtWidgets = None  # headless mode (idat), no GUI available
 
 #-------------------------------------------------------------------------------
 # Chooser items indices. They do differ from the CChooser.item items that are
@@ -466,6 +475,9 @@ class CIDAChooser(CDiaphoraChooser):
         "Import *all* data for sub_* functions"
       )
       self.AddCommand(None)
+      self.cmd_hide_both_sub = self.AddCommand("Hide matches where both are sub_*")
+      self._hidden_items = []
+      self.AddCommand(None)
       self.cmd_highlight_functions = self.AddCommand("Highlight matches")
       self.cmd_unhighlight_functions = self.AddCommand("Unhighlight matches")
     elif not self.show_commands and (self.cmd_show_asm is None or force):
@@ -589,6 +601,33 @@ class CIDAChooser(CDiaphoraChooser):
       timeraction_t(self.bindiff.re_diff, None, 1000)
     elif cmd_id == self.cmd_diff_external:
       self.bindiff.diff_external(self.items[n])
+    elif cmd_id == self.cmd_hide_both_sub:
+      if self._hidden_items:
+        # Restore hidden items
+        self.items.extend(self._hidden_items)
+        self.items = sorted(
+          self.items,
+          key=lambda x: decimal.Decimal(x[CHOOSER_ITEM_RATIO]),
+          reverse=True,
+        )
+        log(f"Restored {len(self._hidden_items)} hidden matches ({len(self.items)} total)")
+        self._hidden_items = []
+        self.actions[self.cmd_hide_both_sub][2] = "Hide matches where both are sub_*"
+      else:
+        # Hide matches where both names are sub_*
+        filtered = []
+        hidden = []
+        for item in self.items:
+          if (item[CHOOSER_ITEM_MAIN_NAME].startswith("sub_")
+              and item[CHOOSER_ITEM_DIFF_NAME].startswith("sub_")):
+            hidden.append(item)
+          else:
+            filtered.append(item)
+        self._hidden_items = hidden
+        self.items = filtered
+        log(f"Hidden {len(hidden)} matches where both names are sub_* ({len(filtered)} remaining)")
+        self.actions[self.cmd_hide_both_sub][2] = "Show hidden matches"
+      self.Refresh()
 
     return True
 
@@ -719,12 +758,17 @@ class CBinDiffExporterSetup(Form):
   <#Select the SQLite database to diff against                       #SQLite database to diff against:{iFileOpen}> <#Maximum address to find functions to export#To address  :{iMaxEA}>
 
   Export options:
+  <Skip export and perform diff only (requires existing database):{rSkipExport}>
+  <#Launch multiple IDA instances to export in parallel (~2x speedup)#Use parallel export:{rParallelExport}>
   <Use the decompiler if available:{rUseDecompiler}>
   <#Use this option to enable or disable exporting microcode#Export microcode instructions and basic blocks:{rExportMicrocode}>
   <Do not export library and thunk functions:{rExcludeLibraryThunk}>
   <#Enable if you want neither sub_* functions nor library functions to be exported#Export only non-IDA generated functions:{rNonIdaSubs}>
   <#Export only function summaries, not all instructions. Showing differences in a graph between functions will not be available.#Do not export instructions and basic blocks:{rFuncSummariesOnly}>
   <#Enable this option to ignore thunk functions, nullsubs, etc....#Ignore small functions:{rIgnoreSmallFunctions}>{cGroupExport}>|
+
+  <#Number of IDA worker processes for parallel export#Parallel workers:{iParallelWorkers}>
+  <#Seconds to wait with no progress before aborting parallel export#Parallel timeout (seconds):{iParallelTimeout}>
 
   Diffing options:
   <Use probably unreliable methods:{rUnreliable}>
@@ -745,8 +789,12 @@ class CBinDiffExporterSetup(Form):
       "iFileOpen": Form.FileInput(open=True, swidth=40, hlp="SQLite database (*.sqlite)"),
       "iMinEA": Form.NumericInput(tp=Form.FT_HEX, swidth=22),
       "iMaxEA": Form.NumericInput(tp=Form.FT_HEX, swidth=22),
+      "iParallelWorkers": Form.StringInput(swidth=10),
+      "iParallelTimeout": Form.StringInput(swidth=10),
       "cGroupExport": Form.ChkGroupControl(
         (
+          "rSkipExport",
+          "rParallelExport",
           "rUseDecompiler",
           "rExcludeLibraryThunk",
           "rIgnoreSmallFunctions",
@@ -784,6 +832,10 @@ class CBinDiffExporterSetup(Form):
     if opts.project_script is not None:
       self.iProjectSpecificRules.value = opts.project_script
 
+    self.rSkipExport.checked = opts.skip_export
+    self.rParallelExport.checked = opts.parallel_export
+    self.iParallelWorkers.value = str(opts.parallel_workers)
+    self.iParallelTimeout.value = str(opts.parallel_timeout)
     self.rUseDecompiler.checked = opts.use_decompiler
     self.rExcludeLibraryThunk.checked = opts.exclude_library_thunk
     self.rUnreliable.checked = opts.unreliable
@@ -807,6 +859,10 @@ class CBinDiffExporterSetup(Form):
     opts = dict(
       file_out=self.iFileSave.value,
       file_in=self.iFileOpen.value,
+      skip_export=self.rSkipExport.checked,
+      parallel_export=self.rParallelExport.checked,
+      parallel_workers=int(self.iParallelWorkers.value or config.NUMBER_OF_WORKERS),
+      parallel_timeout=int(self.iParallelTimeout.value or config.PARALLEL_TIMEOUT),
       use_decompiler=self.rUseDecompiler.checked,
       exclude_library_thunk=self.rExcludeLibraryThunk.checked,
       unreliable=self.rUnreliable.checked,
@@ -1108,48 +1164,78 @@ class CIDABinDiff(diaphora.CBinDiff):
     hide_wait_box()
     return res
 
-  def get_last_crash_func(self):
-    """
-    Get the last inserted row before IDA or Diaphora crashed.
-    """
-    sql = "select address from functions order by id desc limit 1"
-    cur = self.db_cursor()
-    try:
-      cur.execute(sql)
-
-      row = cur.fetchone()
-      if not row:
-        return None
-
-      address = int(row[0])
-    finally:
-      cur.close()
-
-    return address
-
-  def recalculate_primes(self):
+  def init_primes(self) -> Tuple[int, int]:
     """
     Recalculate the primes assigned to a function.
     """
-    sql = "select primes_value from functions"
-
     callgraph_primes = 1
     callgraph_all_primes = {}
+
+    for _, prime, _ in self._funcs_cache.values():
+      callgraph_primes *= prime
+      try:
+        callgraph_all_primes[prime] += 1
+      except KeyError:
+        callgraph_all_primes[prime] = 1
+
+    return callgraph_primes, callgraph_all_primes
+
+  def restore_crashed_export(self):
+    """
+    Restore self._funcs_cache before resuming crashed export
+    """
+    sql = "select address, rowid, primes_value, pseudocode_primes from functions"
 
     cur = self.db_cursor()
     try:
       cur.execute(sql)
       for row in cur.fetchall():
-        ret = row[0]
-        callgraph_primes *= decimal.Decimal(row[0])
-        try:
-          callgraph_all_primes[ret] += 1
-        except KeyError:
-          callgraph_all_primes[ret] = 1
+        self._funcs_cache[int(row[0])] = [
+          row[1],
+          int(row[2]),
+          row[3] and int(row[3]),
+        ]
     finally:
       cur.close()
 
-    return callgraph_primes, callgraph_all_primes
+  def filter_functions(self, functions: Set[int]) -> Iterable[int]:
+    # filter functions to export
+    # Useful for parallel fork
+    if not config.PARALLEL_EXPORT:
+      result = (functions - self._funcs_cache.keys())
+      yield from result
+      return
+
+    if config.WORKER_ID == config.NUMBER_OF_WORKERS:
+      return
+
+    try:
+      job_id, nbr_of_jobs = config.PARALLEL_JOB_QUEUE.get(timeout=300)
+    except Exception:
+      print(f"[{config.WORKER_ID}/{config.NUMBER_OF_WORKERS}] timed out waiting for initial job, exiting")
+      return
+
+    number_of_functions_per_job = (len(functions) + nbr_of_jobs-1)//nbr_of_jobs
+
+    sorted_functions_list = sorted(functions)
+    while job_id >=0:
+      print(f"[{config.WORKER_ID}/{config.NUMBER_OF_WORKERS}] processing job {job_id}")
+      first_function = job_id * number_of_functions_per_job
+      last_function = min((job_id + 1) * number_of_functions_per_job, len(sorted_functions_list))
+
+      for func in sorted_functions_list[first_function:last_function]:
+        if func not in self._funcs_cache:
+          yield func
+
+      # Report and wait for next job
+      config.PARALLEL_REPORT_QUEUE.put((config.WORKER_ID, job_id))
+      try:
+        job_id, _ = config.PARALLEL_JOB_QUEUE.get(timeout=300)
+      except Exception:
+        print(f"[{config.WORKER_ID}/{config.NUMBER_OF_WORKERS}] timed out waiting for next job, exiting")
+        break
+
+    print(f"[{config.WORKER_ID}/{config.NUMBER_OF_WORKERS}] done")
 
   def commit_and_start_transaction(self):
     try:
@@ -1168,36 +1254,33 @@ class CIDABinDiff(diaphora.CBinDiff):
     """
     Internal use, export the database.
     """
-    callgraph_primes = 1
-    callgraph_all_primes = {}
     # pylint: disable-next=consider-using-f-string
     log("Exporting range 0x%08x - 0x%08x" % (self.min_ea, self.max_ea))
-    func_list = list(Functions(self.min_ea, self.max_ea))
+    func_list = set(Functions(self.min_ea, self.max_ea))
     total_funcs = len(func_list)
+    log_step = (total_funcs + 127) // 128  # log every `log_step` functions
+    self._funcs_cache = {}
     t = time.monotonic()
 
     if crashed_before:
-      start_func = self.get_last_crash_func()
-      if start_func is None:
+      self.restore_crashed_export()
+      if not self._funcs_cache:
         warning(
           "Diaphora cannot resume the previous crashed session, the export process will start from scratch."
         )
         crashed_before = False
-      else:
-        callgraph_primes, callgraph_all_primes = self.recalculate_primes()
+
+    callgraph_primes, callgraph_all_primes = self.init_primes()
 
     self.commit_and_start_transaction()
 
-    i = 0
-    self._funcs_cache = {}
-    for func in func_list:
+    i = len(self._funcs_cache.keys() & func_list)
+    for func in self.filter_functions(func_list):
       if user_cancelled():
         raise Exception("Cancelled.")
 
       i += 1
-      if (total_funcs >= 100) and i % (int(total_funcs / 100)) == 0 or i == 1:
-        if config.COMMIT_AFTER_EACH_GUI_UPDATE:
-          self.commit_and_start_transaction()
+      if (i-1) % log_step == 0:
         line = "Exported %d function(s) out of %d total.\nElapsed %d:%02d:%02d second(s), remaining time ~%d:%02d:%02d"
         elapsed = time.monotonic() - t
         remaining = (elapsed / i) * (total_funcs - i)
@@ -1206,19 +1289,11 @@ class CIDABinDiff(diaphora.CBinDiff):
         h, m = divmod(m, 60)
         m_elapsed, s_elapsed = divmod(elapsed, 60)
         h_elapsed, m_elapsed = divmod(m_elapsed, 60)
-        replace_wait_box(
-          line % (i, total_funcs, h_elapsed, m_elapsed, s_elapsed, h, m, s)
-        )
-
-      if crashed_before:
-        rva = func - self.get_base_address()
-        if rva != start_func:
-          continue
-
-        # When we get to the last function that was previously exported, switch
-        # off the 'crash' flag and continue with the next row.
-        crashed_before = False
-        continue
+        message = line % (i, total_funcs, h_elapsed, m_elapsed, s_elapsed, h, m, s)
+        if config.PARALLEL_EXPORT:
+          print(message)
+        else:
+          replace_wait_box(message)
 
       props = self.read_function(func)
       self.clear_pseudo_fields()
@@ -1231,7 +1306,7 @@ class CIDABinDiff(diaphora.CBinDiff):
         callgraph_all_primes[ret] += 1
       except KeyError:
         callgraph_all_primes[ret] = 1
-      
+
       self.save_function(props)
 
       # Try to fix bug #30 and, also, try to speed up operations as doing a
@@ -1239,6 +1314,9 @@ class CIDABinDiff(diaphora.CBinDiff):
       if total_funcs > config.EXPORTING_FUNCTIONS_TO_COMMIT:
         if i % (total_funcs / 10) == 0:
           self.commit_and_start_transaction()
+
+    if config.PARALLEL_EXPORT and config.WORKER_ID < config.NUMBER_OF_WORKERS:
+      return
 
     self.commit_and_start_transaction()
     md5sum = GetInputFileMD5()
@@ -1250,7 +1328,7 @@ class CIDABinDiff(diaphora.CBinDiff):
       self.export_til()
     except:
       log(f"Error reading type libraries: {str(sys.exc_info()[1])}")
-    
+
     if config.EXPORTING_COMPILATION_UNITS:
       self.save_compilation_units()
 
@@ -3577,9 +3655,76 @@ or selecting Edit -> Plugins -> Diaphora - Show results"""
 
 
 #-------------------------------------------------------------------------------
+def _find_python():
+  """Find a usable system Python interpreter (sys.executable may be IDA's embedded Python)."""
+  import shutil
+  # Check if sys.executable is a real Python interpreter
+  if os.path.isfile(sys.executable) and os.path.basename(sys.executable).startswith("python"):
+    return sys.executable
+  # Search PATH
+  for name in ("python3", "python"):
+    found = shutil.which(name)
+    if found:
+      return found
+  return None
+
+
+def _run_parallel_export(idb_path, output_db, num_workers, timeout=None):
+  """Run diaphora_parallel_export.py as a subprocess and return True on success."""
+  script = os.path.join(os.path.dirname(__file__), "diaphora_parallel_export.py")
+  if not os.path.exists(script):
+    warning(f"Parallel export script not found:\n{script}")
+    return False
+
+  python = _find_python()
+  if python is None:
+    warning("Could not find a Python interpreter on PATH.\nParallel export requires a system Python installation.")
+    return False
+
+  # get_idb_path() returns e.g. "D:\file.exe.i64", splitext gives "D:\file.exe"
+  target = os.path.splitext(idb_path)[0]
+
+  log_file = output_db + ".parallel.log"
+  cmd = [python, script, target, str(num_workers)]
+  if timeout is not None:
+    cmd.extend(["--timeout", str(timeout)])
+  env = os.environ.copy()
+  env["IDADIR"] = idc.idadir()
+  log(f"Starting parallel export with {num_workers} workers...")
+  log(f"Command: {' '.join(cmd)}")
+  log(f"IDADIR: {env['IDADIR']}")
+  log(f"Log file: {log_file}")
+
+  try:
+    with open(log_file, "w") as flog:
+      proc = subprocess.Popen(
+        cmd,
+        stdout=subprocess.PIPE,
+        stderr=subprocess.STDOUT,
+        text=True,
+        bufsize=1,
+        env=env,
+      )
+      for line in proc.stdout:
+        flog.write(line)
+        flog.flush()
+        print(line, end="")  # also print to IDA console
+      proc.wait()
+    if proc.returncode != 0:
+      warning(f"Parallel export failed (exit code {proc.returncode}).\nSee log: {log_file}")
+      return False
+    log(f"Parallel export complete. Log saved to: {log_file}")
+    return True
+  except Exception as e:
+    warning(f"Failed to run parallel export:\n{e}")
+    return False
+
+
+#-------------------------------------------------------------------------------
 def _diff_or_export(use_ui, **options):
   # pylint: disable-next=global-statement
   global g_bindiff
+  auto_wait()
   total_functions = len(list(Functions()))
   if get_idb_path() == "" or total_functions == 0:
     warning(
@@ -3599,27 +3744,41 @@ def _diff_or_export(use_ui, **options):
 
     opts = x.get_options()
 
-  if opts.file_out == opts.file_in:
-    warning("Both databases are the same file!")
-    return None
-  elif opts.file_out == "" or len(opts.file_out) < 5:
-    warning(
-      "No output database selected or invalid filename. Please select a database file."
-    )
-    return None
-  elif is_ida_file(opts.file_in) or is_ida_file(opts.file_out):
-    warning(
-      "One of the selected databases is an IDA file. Please select only database files."
-    )
-    return None
+  # Validate skip_export mode
+  if opts.skip_export:
+    if opts.file_in == "":
+      warning("Diff-only mode requires a database file to diff against.")
+      return None
+    if not os.path.exists(opts.file_in):
+      warning(f"Database file to diff against does not exist:\n{opts.file_in}")
+      return None
+    if is_ida_file(opts.file_in):
+      warning("The diff database must be a SQLite file, not an IDA database.")
+      return None
+    if opts.file_out == "":
+      warning("Output database path is required.")
+      return None
+  else:
+    # Standard validation for export mode
+    if opts.file_out == opts.file_in:
+      warning("Both databases are the same file!")
+      return None
+    elif opts.file_out == "" or len(opts.file_out) < 5:
+      warning(
+        "No output database selected or invalid filename. Please select a database file."
+      )
+      return None
+    elif is_ida_file(opts.file_in) or is_ida_file(opts.file_out):
+      warning(
+        "One of the selected databases is an IDA file. Please select only database files."
+      )
+      return None
 
-  export = True
-  if os.path.exists(opts.file_out):
+  export = not opts.skip_export
+  if export and os.path.exists(opts.file_out):
     crash_file = f"{opts.file_out}-crash"
     resume_crashed = False
-    crashed_before = False
     if os.path.exists(crash_file):
-      crashed_before = True
       ret = ask_yn(
         1,
         "The previous export session crashed. Do you want to resume the previous crashed session?",
@@ -3630,9 +3789,12 @@ def _diff_or_export(use_ui, **options):
       elif ret == 1:
         resume_crashed = True
 
-    if not resume_crashed and not crashed_before:
+    if not resume_crashed:
       ret = ask_yn(
-        0, "Export database already exists. Do you want to overwrite it?"
+        0, "Export database already exists.\n\n"
+           "YES = Overwrite and re-export\n"
+           "NO = Skip export, diff only\n\n"
+           "Overwrite the existing export?"
       )
       if ret == -1:
         log("Cancelled")
@@ -3640,6 +3802,13 @@ def _diff_or_export(use_ui, **options):
 
       if ret == 0:
         export = False
+        if os.path.exists(crash_file):
+          os.remove(crash_file)
+        
+        # User chose to skip export, so they must specify a diff database
+        if opts.file_in == "":
+          warning("To skip export, you must select a SQLite database to diff against.")
+          return None
 
     if export:
       if g_bindiff is not None:
@@ -3653,6 +3822,16 @@ def _diff_or_export(use_ui, **options):
 
   t0 = time.monotonic()
   try:
+    # Parallel export: run external process first, then open the result
+    if export and opts.parallel_export:
+      num_workers = max(int(opts.parallel_workers), 1)
+      idb_path = get_idb_path()
+      if not _run_parallel_export(idb_path, opts.file_out, num_workers, opts.parallel_timeout):
+        return None
+      final_t = time.monotonic() - t0
+      log(f"Parallel export done, time taken: {datetime.timedelta(seconds=final_t)}.")
+      export = False  # already exported
+
     bd = CIDABinDiff(opts.file_out)
     bd.use_decompiler = opts.use_decompiler
     bd.exclude_library_thunk = opts.exclude_library_thunk
@@ -3734,6 +3913,10 @@ class BinDiffOptions:
     sqlite_db = os.path.splitext(get_idb_path())[0] + ".sqlite"
     self.file_out = kwargs.get("file_out", sqlite_db)
     self.file_in = kwargs.get("file_in", "")
+    self.skip_export = kwargs.get("skip_export", False)
+    self.parallel_export = kwargs.get("parallel_export", False)
+    self.parallel_workers = kwargs.get("parallel_workers", config.NUMBER_OF_WORKERS)
+    self.parallel_timeout = kwargs.get("parallel_timeout", config.PARALLEL_TIMEOUT)
     self.use_decompiler = kwargs.get(
       "use_decompiler", config.EXPORTING_USE_DECOMPILER
     )
@@ -4069,7 +4252,7 @@ def main():
     _generate_html(db1, diff_db, ea1, ea2, html_asm, html_pseudo)
     idaapi.qexit(0)
   else:
-    _diff_or_export(True)
+    _diff_or_export(not config.PARALLEL_EXPORT)
 
 
 if __name__ == "__main__":

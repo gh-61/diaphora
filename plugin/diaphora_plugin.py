@@ -58,6 +58,9 @@ class DiaphoraPlugin(idaapi.plugin_t):
     pass
 
   def run(self, arg):
+    from ida_auto import auto_wait
+    auto_wait()
+
     if self.diaphora_main is None:
       self.diaphora_main = resolve_diaphora()
 
