@@ -24,49 +24,69 @@ import time
 import threading
 
 #-------------------------------------------------------------------------------
-def threads_apply(threads, targets, wait_time, log_refresh, timeout):
+def threads_apply(threads, targets, wait_time, log_refresh, timeout, cancel_event=None):
   """
   Run a number of @threads calling a function with arguments from @targets,
   waiting and checking the threads if they finished every @wait_time seconds,
   calling @log_refresh whenever it's required.
+
+  If @cancel_event is provided (a threading.Event), it will be set on
+  cancellation so worker threads can check it and exit early.
   """
   times = 0
   first = True
   threads_list = []
-  while first or len(targets) > 0 or len(threads_list) > 0:
-    first = False
-    times += 1
-    if len(targets) > 0 and len(threads_list) < threads:
-      item = targets.pop()
-      target = item["target"]
-      args = item["args"]
+  try:
+    while first or len(targets) > 0 or len(threads_list) > 0:
+      first = False
+      times += 1
 
-      t = threading.Thread(target=target, args=args)
-      t.time = time.monotonic()
-      t.timeout = False
-      
-      for key in item.keys():
-        if key not in ["target", "args"]:
-          setattr(t, key, item[key])
+      # Fill all available thread slots at once
+      while len(targets) > 0 and len(threads_list) < threads:
+        item = targets.pop()
+        target = item["target"]
+        args = item["args"]
 
-      t.start()
-      threads_list.append(t)
+        t = threading.Thread(target=target, args=args)
+        t.time = time.monotonic()
+        t.timeout = False
 
-    for i, t in enumerate(threads_list):
-      if not t.is_alive():
-        if log_refresh:
-          log_refresh(f"[Parallel] Heuristic '{t.name}' done")
-        del threads_list[i]
-        break
+        for key in item.keys():
+          if key not in ["target", "args"]:
+            setattr(t, key, item[key])
 
-      if time.monotonic() - t.time > timeout:
-        t.timeout = True
-      t.join(wait_time)
+        t.start()
+        threads_list.append(t)
 
-    if times % 50 == 0:
-      names = []
-      for x in threads_list:
-        names.append(x.name)
-      tmp_names = ", ".join(names)
-      log_refresh(f"[Parallel] {len(threads_list)} thread(s) still running: {tmp_names}")
+      # Reap finished threads
+      for i in range(len(threads_list) - 1, -1, -1):
+        t = threads_list[i]
+        if not t.is_alive():
+          if log_refresh:
+            log_refresh(f"[Parallel] Heuristic '{t.name}' done")
+          del threads_list[i]
 
+      # Check timeouts and wait
+      for t in threads_list:
+        if time.monotonic() - t.time > timeout:
+          t.timeout = True
+
+      if threads_list:
+        threads_list[0].join(wait_time)
+
+      if times % 50 == 0:
+        names = []
+        for x in threads_list:
+          names.append(x.name)
+        tmp_names = ", ".join(names)
+        log_refresh(f"[Parallel] {len(threads_list)} thread(s) still running: {tmp_names}")
+  except:
+    # On cancellation or any error, signal worker threads to stop
+    if cancel_event is not None:
+      cancel_event.set()
+    # Clear remaining targets so no new threads are spawned
+    targets.clear()
+    # Wait for running threads to finish (they should check cancel_event)
+    for t in threads_list:
+      t.join(timeout=5)
+    raise
