@@ -19,22 +19,18 @@ from collections import Counter
 
 import idc
 import idaapi
-import idautils
-import ida_bytes
-import ida_funcs
-import ida_gdl
-import ida_graph
-import ida_ida
-import ida_idaapi
-import ida_kernwin
-import ida_lines
-import ida_name
+
+from idc import *
+from idaapi import *
+from idautils import *
 
 try:
-    from PySide6 import QtCore, QtGui, QtWidgets
-    has_pyside6 = True
-except ImportError:
-    has_pyside6 = False
+  from PyQt5 import QtWidgets
+except ImportError as e:
+  print(f'{os.path.basename(__file__)} importerror {e}')
+
+sys.path.append("..")
+import diaphora_config as config
 
 try:
     import nltk

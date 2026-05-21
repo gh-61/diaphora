@@ -31,9 +31,11 @@ import importlib
 import threading
 import traceback
 
+from base64 import b64decode
 from io import StringIO
 from threading import Lock
 from multiprocessing import cpu_count
+from multiprocessing.managers import BaseManager
 
 import diaphora_config as config
 import diaphora_heuristics
@@ -65,6 +67,8 @@ from diaphora_heuristics import (
   get_query_fields,
 )
 
+from diaphora_sql import InsertInto, NATIVE, MICROCODE
+
 import db_support
 from db_support import schema
 
@@ -81,17 +85,20 @@ from jkutils.factor import (
 
 try:
   import idaapi
+  import ida_pro
+  from idc import ARGV
 
   IS_IDA = True
 except ImportError:
   IS_IDA = False
 
-importlib.reload(ml.basic_engine)
-importlib.reload(config)
-importlib.reload(schema)
-importlib.reload(jk_threads)
-importlib.reload(db_support)
-importlib.reload(diaphora_heuristics)
+if config.PARALLEL_EXPORT is False:
+  importlib.reload(ml.basic_engine)
+  importlib.reload(config)
+  importlib.reload(schema)
+  importlib.reload(jk_threads)
+  importlib.reload(db_support)
+  importlib.reload(diaphora_heuristics)
 
 if hasattr(sys, "set_int_max_str_digits"):
   sys.set_int_max_str_digits(0)
@@ -364,6 +371,7 @@ class CBinDiff:
     self.dbs_dict = {}
     self.db = None  # Used exclusively by the exporter!
     self.open_db()
+    self.insert_into = InsertInto()
 
     self.all_matches = {"best": [], "partial": [], "unreliable": []}
     self.matched_primary = {}
@@ -415,7 +423,9 @@ class CBinDiff:
     self.re_cache = {}
     self._funcs_cache = {}
     self.ratios_cache = {}
+    self.ratios_cache_lock = Lock()
     self.items_lock = Lock()
+    self._cancel_event = threading.Event()
 
     self.is_symbols_stripped = False
     self.is_patch_diff = False
@@ -472,9 +482,8 @@ class CBinDiff:
       cpus = 1
     self.cpu_count = self.get_value_for("CPU_COUNT", cpus)
 
-    # XXX: FIXME: Parallel diffing is broken outside of IDA due to parallelism problems
-    if not IS_IDA:
-      self.cpu_count = 1
+    # Parallel diffing is now safe: ratios_cache is protected by ratios_cache_lock
+    # and add_match is protected by items_lock.
 
     ####################################################################
 
@@ -719,11 +728,6 @@ class CBinDiff:
     database.
     """
     instructions_ids = {}
-    sql = """insert into main.instructions (address, mnemonic, disasm,
-                      comment1, comment2, operand_names, name,
-                      type, pseudocomment, pseudoitp, func_id,
-                      asm_type)
-                values (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 'native')"""
     cur_execute = cur.execute
     for key in bb_data:
       for instruction in bb_data[key]:
@@ -753,7 +757,7 @@ class CBinDiff:
         instruction_properties.append(pseudocomment)
         instruction_properties.append(pseudoitp)
         instruction_properties.append(func_id)
-        cur.execute(sql, instruction_properties)
+        self.insert_into.main_instructions(cur_execute, instruction_properties, NATIVE)
         db_id = cur.lastrowid
         instructions_ids[addr] = db_id
     return cur_execute, instructions_ids
@@ -767,8 +771,6 @@ class CBinDiff:
     """
     num = 0
     bb_ids = {}
-    sql1 = "insert into main.basic_blocks (num, address, asm_type) values (?, ?, 'native')"
-    sql2 = "insert into main.bb_instructions (basic_block_id, instruction_id) values (?, ?)"
 
     self_get_bb_id = self.get_bb_id
     for key in bb_data:
@@ -777,33 +779,29 @@ class CBinDiff:
       ins_ea = str(key)
       last_bb_id = self_get_bb_id(ins_ea)
       if last_bb_id is None:
-        cur_execute(sql1, (num, str(ins_ea)))
+        self.insert_into.main_basic_blocks(cur_execute, (num, str(ins_ea)), NATIVE)
         last_bb_id = cur.lastrowid
       bb_ids[ins_ea] = last_bb_id
 
       # Insert relations between basic blocks and instructions
-      insert_args = []
       for instruction in bb_data[key]:
         ins_id = instructions_ids[instruction[0]]
-        insert_args.append([last_bb_id, ins_id])
-      cur.executemany(sql2, insert_args)
+        self.insert_into.main_bb_instructions(cur_execute, (last_bb_id, ins_id), NATIVE)
 
     # Insert relations between basic blocks
-    sql = "insert into main.bb_relations (parent_id, child_id) values (?, ?)"
-    insert_args = []
     for key in bb_relations:
       for bb in bb_relations[key]:
         bb = str(bb)
         key = str(key)
-        insert_args.append([bb_ids[key], bb_ids[bb]])
-    cur.executemany(sql, insert_args)
+        try:
+          self.insert_into.main_bb_relations(cur_execute, (bb_ids[key], bb_ids[bb]), NATIVE)
+        except:
+          # key doesnt exist because it doesnt have forward references to any bb
+          log(f"Error: {str(sys.exc_info()[1])}")
 
     # And finally insert the functions to basic blocks relations
-    insert_args = []
-    sql = "insert into main.function_bblocks (function_id, basic_block_id, asm_type) values (?, ?, 'native')"
     for key, bb_id in bb_ids.items():
-      insert_args.append([func_id, bb_id])
-    cur.executemany(sql, insert_args)
+      self.insert_into.main_function_bblocks(cur_execute, (func_id, bb_id), NATIVE)
 
   def save_microcode_instructions(
     self, func_id, cur, cur_execute, microcode_bblocks, microcode_bbrelations
@@ -811,27 +809,17 @@ class CBinDiff:
     """
     Save all the microcode instructions in the basic block @bb_data to the database.
     """
-    sql_inst = """insert into main.instructions (address, mnemonic, disasm, comment1,
-                         pseudocomment, func_id, asm_type)
-                values (?, ?, ?, ?, ?, ?, 'microcode')"""
-    sql_bblock = "insert into main.basic_blocks (num, address, asm_type) values (?, ?, 'microcode')"
-    sql_bbinst = "insert into main.bb_instructions (basic_block_id, instruction_id) values (?, ?)"
-    sql_bbrelations = (
-      "insert into main.bb_relations (parent_id, child_id) values (?, ?)"
-    )
-    sql_func_blocks = "insert into main.function_bblocks (function_id, basic_block_id, asm_type) values (?, ?, 'microcode')"
     num = 0
     for key in microcode_bblocks:
       # Create a new microcode basic block
       start_ea = self.get_valid_prop(microcode_bblocks[key]["start"])
-      cur_execute(sql_bblock, [num, start_ea])
+      self.insert_into.main_basic_blocks(cur_execute, [num, start_ea], MICROCODE)
       bblock_id = cur.lastrowid
       microcode_bblocks[key]["bblock_id"] = bblock_id
 
       # Add the function -> basic block relation
-      cur_execute(sql_func_blocks, (func_id, bblock_id))
+      self.insert_into.main_function_bblocks(cur_execute, (func_id, bblock_id), MICROCODE)
 
-      insert_args = []
       for line in microcode_bblocks[key]["lines"]:
         if line["mnemonic"] is not None:
           address = self.get_valid_prop(line["address"])
@@ -849,20 +837,18 @@ class CBinDiff:
             pseudocomment,
             func_id,
           ]
-          cur_execute(sql_inst, arguments)
+          self.insert_into.main_instructions(cur_execute, arguments, MICROCODE)
 
           inst_id = cur.lastrowid
           line["instruction_id"] = inst_id
 
           # Add the microcode instrution to the current basic block
-          insert_args.append([bblock_id, inst_id])
-      cur.executemany(sql_bbinst, insert_args)
+          self.insert_into.main_bb_instructions(cur_execute, (bblock_id, inst_id), MICROCODE)
 
       # Incrase the current basic block number
       num += 1
 
     # And, finally, insert the relationships between basic blocks
-    insert_args = []
     for node in microcode_bbrelations:
       parent_id = microcode_bblocks[node]["bblock_id"]
       for children in microcode_bbrelations[node]:
@@ -870,8 +856,7 @@ class CBinDiff:
         # with them, just ignore...
         if children in microcode_bblocks:
           child_id = microcode_bblocks[children]["bblock_id"]
-          insert_args.append([parent_id, child_id])
-    cur.executemany(sql_bbrelations, insert_args)
+          self.insert_into.main_bb_relations(cur_execute, [parent_id, child_id], MICROCODE)
 
   def get_function_from_dictionary(self, d):
     """ Get a tuple ready to be used to insert rows from a given dictionary.
@@ -926,25 +911,8 @@ class CBinDiff:
         else:
           new_props.append(prop)
 
-      sql = """insert into main.functions (name, nodes, edges, indegree, outdegree, size,
-                    instructions, mnemonics, names, prototype,
-                    cyclomatic_complexity, primes_value, address,
-                    comment, mangled_function, bytes_hash, pseudocode,
-                    pseudocode_lines, pseudocode_hash1, pseudocode_primes,
-                    function_flags, assembly, prototype2, pseudocode_hash2,
-                    pseudocode_hash3, strongly_connected, loops, rva,
-                    tarjan_topological_sort, strongly_connected_spp,
-                    clean_assembly, clean_pseudo, mnemonics_spp, switches,
-                    function_hash, bytes_sum, md_index, constants,
-                    constants_count, segment_rva, assembly_addrs, kgh_hash,
-                    source_file, userdata, microcode, clean_microcode,
-                    microcode_spp, export_time)
-                  values (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?,
-                      ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?,
-                      ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)"""
-
       try:
-        cur.execute(sql, new_props)
+        self.insert_into.main_functions(cur.execute, new_props)
       except:
         logging.error(
           "Error handling props in save_function(): %s", str(new_props)
@@ -958,18 +926,13 @@ class CBinDiff:
 
       # Phase 2: Save the callers and callees of the function
       callers, callees = props[len(props) - 4:len(props) - 2]
-      sql = "insert into callgraph (func_id, address, type) values (?, ?, ?)"
-      insert_args = []
       for caller in callers:
-        insert_args.append([func_id, str(caller), "caller"])
+        self.insert_into.callgraph(cur.execute, (func_id, str(caller), "caller"))
 
       for callee in callees:
-        insert_args.append([func_id, str(callee), "callee"])
-      cur.executemany(sql, insert_args)
+        self.insert_into.callgraph(cur.execute, (func_id, str(callee), "callee"))
 
       # Phase 3: Insert the constants of the function
-      sql = "insert into constants (func_id, constant) values (?, ?)"
-      insert_args = []
       props_dict = self.create_function_dictionary(props)
       for constant in props_dict["constants"]:
         should_add = False
@@ -980,8 +943,7 @@ class CBinDiff:
           constant = str(constant)
 
         if should_add:
-          insert_args.append([func_id, constant])
-      cur.executemany(sql, insert_args)
+          self.insert_into.constants(cur.execute, (func_id, constant))
 
       # Phase 4: Save the basic blocks relationships
       if not self.function_summaries_only:
@@ -1531,7 +1493,8 @@ class CBinDiff:
       targets     = heuristic_functions,
       wait_time   = config.THREADS_WAIT_TIME,
       log_refresh = log_refresh,
-      timeout     = config.SQL_TIMEOUT_LIMIT
+      timeout     = config.SQL_TIMEOUT_LIMIT,
+      cancel_event = self._cancel_event
     )
 
     self.cleanup_matches()
@@ -1628,6 +1591,11 @@ class CBinDiff:
       return 0
     return ast_ratio(ast1, ast2)
 
+  def _cache_ratio(self, key, r):
+    """Thread-safe write to ratios_cache."""
+    with self.ratios_cache_lock:
+      self.ratios_cache[key] = r
+
   def check_ratio(self, main_d, diff_d):
     """
     Compare two functions and generate a similarity ratio from 0.0 to 1.0 where
@@ -1637,8 +1605,9 @@ class CBinDiff:
     ea1 = main_d["ea"]
     ea2 = diff_d["ea"]
     key = f"{ea1}-{ea2}"
-    if key in self.ratios_cache:
-      return self.ratios_cache[key]
+    with self.ratios_cache_lock:
+      if key in self.ratios_cache:
+        return self.ratios_cache[key]
 
     ast1 = main_d["pseudocode_primes"]
     ast2 = diff_d["pseudocode_primes"]
@@ -1665,7 +1634,7 @@ class CBinDiff:
       decimal_values = "{0:.1f}"
 
     if bytes_hash1 == bytes_hash2:
-      self.ratios_cache[key] = 1.0
+      self._cache_ratio(key, 1.0)
       return 1.0
 
     v3 = 0
@@ -1679,7 +1648,7 @@ class CBinDiff:
       ast_done = True
       v3 = self.ast_ratio(ast1, ast2)
       if v3 == 1.0:
-        self.ratios_cache[key] = 1.0
+        self._cache_ratio(key, 1.0)
         return v3
 
     v1 = 0
@@ -1701,7 +1670,7 @@ class CBinDiff:
           if fratio == real_quick_ratio:
             v1 = quick_ratio(clean_pseudo1, clean_pseudo2)
             if v1 == 1.0:
-              self.ratios_cache[key] = 1.0
+              self._cache_ratio(key, 1.0)
               return 1.0
 
     v2 = fratio(clean_assembly1, clean_assembly2)
@@ -1712,21 +1681,21 @@ class CBinDiff:
       if fratio == real_quick_ratio:
         v2 = quick_ratio(clean_assembly1, clean_assembly2)
         if v2 == 1.0:
-          self.ratios_cache[key] = 1.0
+          self._cache_ratio(key, 1.0)
           return 1.0
 
     if self.relaxed_ratio and not ast_done:
       v3 = fratio(ast1, ast2)
       v3 = float(decimal_values.format(v3))
       if v3 == 1:
-        self.ratios_cache[key] = 1.0
+        self._cache_ratio(key, 1.0)
         return 1.0
 
     v4 = 0.0
     if md1 == md2 and md1 > 0.0:
       # A MD-Index >= 10.0 is somehow rare
       if self.relaxed_ratio and md1 > config.MINIMUM_RARE_MD_INDEX:
-        self.ratios_cache[key] = 1.0
+        self._cache_ratio(key, 1.0)
         return 1.0
       v4 = min((v1 + v2 + v3 + 3.0) / 5, 1.0)
 
@@ -1735,7 +1704,7 @@ class CBinDiff:
       v5 = fratio(clean_micro1, clean_micro2)
       v5 = float(decimal_values.format(v5))
       if v5 == 1:
-        self.ratios_cache[key] = 1.0
+        self._cache_ratio(key, 1.0)
         return 1.0
 
     values_set = set([v1, v2, v3, v4, v5])
@@ -1757,7 +1726,7 @@ class CBinDiff:
         r = 0.99
 
     debug_refresh(f"self.ratios_cache[{main_d['name']}-{diff_d['name']}] = {r}")
-    self.ratios_cache[key] = r
+    self._cache_ratio(key, r)
     return r
 
   def all_functions_matched(self):
@@ -1879,6 +1848,10 @@ class CBinDiff:
     cur_thread = threading.current_thread()
     t = time.monotonic()
     while self.continue_getting_sql_rows(i):
+      if self._cancel_event.is_set():
+        log(f"Cancelled heuristic '{cur_thread.name}'")
+        return matches
+
       if time.monotonic() - t > self.timeout or cur_thread.timeout:
         log(f"Timeout with heuristic '{cur_thread.name}'")
         raise SystemExit()
@@ -3332,6 +3305,8 @@ class CBinDiff:
     tmp_matches.extend(list(self.all_matches["partial"]))
     tmp_matches = sorted(tmp_matches, key=lambda x: [int(x[0]), int(x[2])])
 
+    # Collect all gaps
+    gaps = []
     size = len(tmp_matches)
     for i, match in enumerate(tmp_matches):
       if i == 0 or i == size:
@@ -3345,7 +3320,24 @@ class CBinDiff:
 
       area1 = [prev_ea1, curr_ea1]
       area2 = [prev_ea2, curr_ea2]
-      self.find_functions_between(area1, area2)
+      gaps.append((area1, area2))
+
+    if not gaps:
+      return
+
+    # Dispatch gaps in parallel
+    targets = []
+    for i, (area1, area2) in enumerate(gaps):
+      targets.append({
+        "target": self.find_functions_between,
+        "args": (area1, area2),
+        "name": f"Gap {i}",
+      })
+
+    threads_apply(
+      self.cpu_count, targets, config.THREADS_WAIT_TIME,
+      log_refresh, self.timeout, cancel_event=self._cancel_event
+    )
 
   def find_related_constants(self, main_row, diff_row):
     """
@@ -3377,6 +3369,33 @@ class CBinDiff:
         for constant in inter_consts:
           cur.execute(sql, (str(constant),))
           self.add_matches_internal(cur, best="best", partial="partial")
+    finally:
+      cur.close()
+
+  def _process_cu_pair(self, sql_base, exclusion_main, exclusion_diff,
+                       main_start_ea, main_end_ea, diff_start_ea, diff_end_ea,
+                       cu_name):
+    """
+    Process a single CU pair: run the cross-product query and add matches.
+    Designed to run in a worker thread via threads_apply().
+    """
+    sql = sql_base
+    if exclusion_main:
+      sql += " and f.name not in (%s)" % exclusion_main
+    if exclusion_diff:
+      sql += " and df.name not in (%s)" % exclusion_diff
+
+    if self._cancel_event.is_set():
+      return
+
+    cur = self.db_cursor()
+    try:
+      cur.execute(sql, (main_start_ea, main_end_ea, diff_start_ea, diff_end_ea))
+      self.add_matches_internal(cur, "best", "partial")
+    except SystemExit:
+      log(f"[Related CU] CU '{cu_name}' timed out")
+    except:
+      log(f"[Related CU] CU '{cu_name}' error: {sys.exc_info()[1]}")
     finally:
       cur.close()
 
@@ -3414,15 +3433,30 @@ class CBinDiff:
     sql_main = sql.replace("{db}", "main")
     sql_diff = sql.replace("{db}", "diff")
 
-    sql = f"""select """ + get_query_fields(heur) + """
+    sql_base = """select """ + get_query_fields(heur) + """
                from functions f,
                     diff.functions df
               where cast(f.address as real)  between ? and ?
-                and cast(df.address as real) between ? and ? """
+                and cast(df.address as real) between ? and ?
+                and f.instructions > 5
+                and df.instructions > 5
+                and df.instructions between max(f.instructions * 0.5, 6) and f.instructions * 2.0
+                and df.nodes between max(f.nodes * 0.5, 1) and f.nodes * 2.0 """
 
+    # Phase 1: Collect unique CU pairs (sequential, fast)
+    done_cu_pairs = set()
+    cu_pairs = []
+    no_cu_count = 0
+    total_matches = len(l)
     cur = self.db_cursor()
     try:
-      for match in l:
+      for idx, match in enumerate(l):
+        if idx % 1000 == 0:
+          log_refresh(
+            f"[{heur}] Collecting CU pairs: {idx}/{total_matches} matches scanned, "
+            f"{len(cu_pairs)} CU pairs found"
+          )
+
         ratio = match[5]
         if ratio < config.RELATED_MATCHES_MIN_RATIO:
           break
@@ -3436,16 +3470,58 @@ class CBinDiff:
         diff_row = cur.fetchone()
 
         if main_row is None or diff_row is None:
+          no_cu_count += 1
           continue
 
+        cu_pair = (main_row["cu_id"], diff_row["cu_id"])
+        if cu_pair in done_cu_pairs:
+          continue
+        done_cu_pairs.add(cu_pair)
+
         main_start_ea = float(main_row["start_ea"])
-        main_end_ea   = float(main_row["start_ea"])
+        main_end_ea   = float(main_row["end_ea"])
         diff_start_ea = float(diff_row["start_ea"])
-        diff_end_ea   = float(diff_row["start_ea"])
-        cur.execute(sql, (main_start_ea, main_end_ea, diff_start_ea, diff_end_ea))
-        self.add_matches_internal(cur, "best", "partial")
+        diff_end_ea   = float(diff_row["end_ea"])
+        cu_name = f"{main_row['cu_name']}<->{diff_row['cu_name']}"
+
+        cu_pairs.append((main_start_ea, main_end_ea, diff_start_ea, diff_end_ea, cu_name))
     finally:
       cur.close()
+
+    if not cu_pairs:
+      return
+
+    # Snapshot exclusion lists once before dispatching threads.
+    # Use SQL-safe quoting: replace ' with '' and wrap in single quotes.
+    # Skip exclusion if too many matches (SQLite can struggle with huge IN clauses);
+    # check_match() will filter them out at the Python level instead.
+    max_exclusion_size = 5000
+    def sql_quote(s):
+      return "'" + s.replace("'", "''") + "'"
+    if len(self.matched_primary) <= max_exclusion_size:
+      exclusion_main = ",".join(sql_quote(n) for n in self.matched_primary) or None
+    else:
+      exclusion_main = None
+    if len(self.matched_secondary) <= max_exclusion_size:
+      exclusion_diff = ",".join(sql_quote(n) for n in self.matched_secondary) or None
+    else:
+      exclusion_diff = None
+    # Phase 2: Process CU pairs in parallel
+    log_refresh(
+      f"[{heur}] Processing {len(cu_pairs)} CU pairs using {self.cpu_count} thread(s)..."
+    )
+    targets = []
+    for i, (ms, me, ds, de, cu_name) in enumerate(cu_pairs):
+      targets.append({
+        "target": self._process_cu_pair,
+        "args": (sql_base, exclusion_main, exclusion_diff, ms, me, ds, de, cu_name),
+        "name": f"CU pair {i}: {cu_name}",
+      })
+
+    threads_apply(
+      self.cpu_count, targets, config.THREADS_WAIT_TIME,
+      log_refresh, self.timeout, cancel_event=self._cancel_event
+    )
 
   def find_related_matches(self, iteration):
     """
@@ -3651,7 +3727,7 @@ class CBinDiff:
               # Find new matches by digging from previous very good matches
               self.find_related_matches(iteration)
 
-            self.find_related_compilation_unit(iteration)
+              self.find_related_compilation_unit(iteration)
 
             # Find new matches in the functions between matches
             self.find_locally_affine_functions(iteration)
@@ -3688,6 +3764,26 @@ class CBinDiff:
       cur.close()
     return True
 
+class QueueManager(BaseManager):
+  pass
+
+def init_parallel_export() -> None:
+  config.PARALLEL_EXPORT = True
+  config.WORKER_ID = int(ARGV[1])
+  config.NUMBER_OF_WORKERS = int(ARGV[2])
+  if config.WORKER_ID == config.NUMBER_OF_WORKERS:
+    # finalizing, no need to initilize queues
+    return
+
+  port = int(ARGV[3])
+  authkey = b64decode(ARGV[4].encode("ASCII"))
+  QueueManager.register('get_job_queue')
+  QueueManager.register('get_report_queue')
+  m = QueueManager(address=('localhost', port), authkey=authkey)
+  m.connect()
+  config.PARALLEL_JOB_QUEUE = m.get_job_queue()
+  config.PARALLEL_REPORT_QUEUE = m.get_report_queue()
+
 
 if __name__ == "__main__":
   version_info = sys.version_info
@@ -3723,8 +3819,15 @@ if __name__ == "__main__":
     with open(script, "rb") as f:
       buf = f.read()
 
+    # pylint: disable-next=exec-used
     exec(compile(buf, script, "exec"))
     do_diff = False
+
+    if config.PARALLEL_EXPORT is True and config.PARALLEL_REPORT_QUEUE is not None:
+      # Report and close IDA for current worker in parallel export
+      config.PARALLEL_REPORT_QUEUE.put((config.WORKER_ID, -1))
+      ida_pro.qexit(0)
+
   else:
     import argparse
 
